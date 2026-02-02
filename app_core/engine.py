@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225] 
+
 import os
 import shutil
 import time
@@ -213,6 +216,7 @@ class ERayZerEngine:
                 T.Lambda(_central_crop),
                 T.Resize((self.image_size, self.image_size), interpolation=T.InterpolationMode.BICUBIC, antialias=True),
                 T.ToTensor(),
+                # T.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
             ]
         )
         amp_dtype = str(training.get("amp_dtype", "fp16")).lower()
@@ -240,6 +244,8 @@ class ERayZerEngine:
         cfg.inference_view_selector_type = cfg.get("inference_view_selector_type", training.view_selector.type)
 
     def _load_model(self) -> torch.nn.Module:
+        if isinstance(self.config.model.model_params, dict):
+            self.config = edict(self.config.model.model_params)
         module_name, class_name = self.config.model.class_name.rsplit(".", 1)
         ModelClass = __import__(module_name, fromlist=[class_name]).__dict__[class_name]
         model = ModelClass(self.config).to(self.device)
