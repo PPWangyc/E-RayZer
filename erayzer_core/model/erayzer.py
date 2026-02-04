@@ -510,6 +510,227 @@ class ERayZer(nn.Module):
 
         return result
 
+    def forward_inference(self, data):
+        # input, target, input_idx, target_idx = self.split_data(data, random_index=self.random_index)
+        image_all = data['image'] * 2.0 - 1.0                                     # [b, v_all, c, h, w], range (0,1) to (-1,1)
+        b, v, c, h, w = image_all.shape
+        device = image_all.device
+
+        pad_input = False
+        v_all = v
+
+        '''se3 pose prediction for all views'''
+        # tokenize images, add spatial-temporal p.e.
+        img_tokens = self.image_tokenizer(image_all)                              # [b*v_all, n, d]
+        _, n, d = img_tokens.shape
+
+        # add spatial positional embedding
+        if self.use_pe_embedding_layer:
+            img_tokens = self.add_spatial_pe(
+                img_tokens,
+                b, v_all,
+                self.hh,
+                self.ww,
+                embedder=self.pe_embedder,
+            )
+
+        # concanate all tokens together
+        cam_tokens = repeat(self.camera_token, '1 n d -> bv n d', bv=b*v_all)
+        register_tokens = repeat(self.register_token, '1 n d -> bv n d', bv=b*v_all)
+        all_tokens = torch.cat([cam_tokens, register_tokens, img_tokens], dim=1)
+        _, n2, _ = all_tokens.shape
+        all_tokens = rearrange(all_tokens, '(b v) n d -> b (v n) d', b=b)         # [b, v_all*n, d]
+
+        # pose estimation for all views
+        all_tokens = self.run_vggt_encoder(all_tokens, b, v_all)
+        all_tokens = rearrange(all_tokens, 'b (v n) d -> (b v) n d', v=v_all)
+        cam_tokens, _, _ = all_tokens.split([1, self.num_register_tokens, n], dim=1) 
+
+        # get se3 poses and intrinsics
+        cam_tokens = cam_tokens[:, 0]                                             # [b*v_all, d]
+        cam_info = self.pose_predictor(cam_tokens, v_all)                 # [b*v_all, num_pose_element+3+4], rot, 3d trans, 4d fxfycxcy
+        pred_c2w, pred_fxfycxcy = get_cam_se3(cam_info) # [b*v_all, 4, 4], [b*v_all, 4]
+        pred_c2w = rearrange(pred_c2w, '(b v) n d -> b v n d', b=b)
+        pred_fxfycxcy = rearrange(pred_fxfycxcy, '(b v) d -> b v d', b=b).detach()
+        normalized = True
+
+        # get plucker ray and embeddings
+        if v < 5:
+            v_input = 5
+            c2w_input = pred_c2w[:, :5, ...]                                   # [b, v_input, 4, 4]
+            fxfycxcy_input = pred_fxfycxcy[:, :5, ...]                         # [b, v_input, 4]
+            img_tokens_input = rearrange(img_tokens, '(b v) n d -> b v n d', b=b)[:, :5, ...]
+        else:
+            v_input = v
+            c2w_input = pred_c2w[:, :v, ...]                                   # [b, v_input, 4, 4]
+            fxfycxcy_input = pred_fxfycxcy[:, :v, ...]                         # [b, v_input, 4]
+            img_tokens_input = rearrange(img_tokens, '(b v) n d -> b v n d', b=b)[:, :v, ...]
+
+        c2w_target = pred_c2w[:, :v]                                           # [b, v_target, 4, 4]
+        fxfycxcy_target = pred_fxfycxcy[:, :v]                                 # [b, v_target, 4]
+    
+        plucker_rays_input = cam_info_to_plucker(c2w_input, fxfycxcy_input, self.config.model.target_image, normalized=normalized, return_moment=True)
+        plucker_rays_input = rearrange(plucker_rays_input, '(b v) c h w -> b v h w c', b=b, v=v_input)
+        plucker_emb_input = self.input_pose_tokenizer(plucker_rays_input)                                     # [b*v_input, n, d]
+        if self.use_pe_embedding_layer:
+            plucker_emb_input = self.add_spatial_pe(
+                plucker_emb_input,
+                b, v_input,
+                self.hh, self.ww,
+                embedder=self.pe_embedder_plucker,
+            )
+        plucker_emb_input = rearrange(plucker_emb_input, '(b v) n d -> b (v n) d', v=v_input)                 # [b, v_input*n, d]
+
+        '''predict scene representation using (posed) input views'''
+        # get posed image representation
+        img_tokens_input = rearrange(img_tokens_input, 'b v n d -> b (v n) d')
+        img_tokens_input = torch.cat([img_tokens_input, plucker_emb_input], dim=-1)                           # [b, v_input*n, 2d]
+        all_tokens = self.mlp_fuse(img_tokens_input)                                                          # [b, v_input*n, d]
+
+        # encoder layers, predict depths and feature vectors
+        all_tokens = self.run_vggt_encoder_geom(all_tokens, b, v_input)                                                   # [b, v_input*n, d]
+        img_aligned_gaussians = self.image_token_decoder(all_tokens)
+        img_aligned_gaussians = rearrange(
+            img_aligned_gaussians,
+            'b (v n) d -> b v n d',
+            v=v_input,
+        )[:, :v]
+        img_aligned_gaussians = rearrange(
+            img_aligned_gaussians, 
+            'b v n (ph pw c) -> b (v n ph pw) c', 
+            ph=self.ph,
+            pw=self.pw,
+        )
+        xyz, features, scaling, rotation, opacity = self.upsampler.to_gs(img_aligned_gaussians)
+        img_aligned_xyz = rearrange(
+            xyz,
+            "b (v hh ww ph pw) c -> b v c (hh ph) (ww pw)",
+            v=v,
+            hh=self.hh,
+            ww=self.ww,
+            ph=self.ph,
+            pw=self.pw,
+        )
+
+        if self.config.model.hard_pixelalign:
+            img_aligned_xyz = img_aligned_xyz.mean(dim=2, keepdim=True)
+            img_aligned_xyz = self.range_func(img_aligned_xyz)
+            plucker_rays_input = cam_info_to_plucker(c2w_input[:, :v, ...], fxfycxcy_input[:, :v, ...], self.config.model.target_image, normalized=normalized, return_moment=False)
+            plucker_rays_input = rearrange(plucker_rays_input, '(b v) c h w -> b v c h w', b=b)
+            ray_o, ray_d = plucker_rays_input.split([3, 3], dim=2)
+            img_aligned_xyz = ray_o + img_aligned_xyz * ray_d
+            xyz = rearrange(
+                img_aligned_xyz,
+                "b v c (hh ph) (ww pw) -> b (v hh ww ph pw) c",
+                ph=self.ph,
+                pw=self.pw,
+            )
+        else:
+            xyz = img_aligned_xyz 
+
+        gaussian_attrs = edict(
+            xyz=xyz,
+            features=features,
+            scaling=scaling,
+            rotation=rotation,
+            opacity=opacity,
+        )
+
+        loss_metrics = None
+        render = None
+        height, width = h, w
+        if normalized:
+            fxfycxcy_target[..., 0] *= width
+            fxfycxcy_target[..., 1] *= height
+            fxfycxcy_target[..., 2] *= width
+            fxfycxcy_target[..., 3] *= height
+        render = self.renderer(
+            xyz,
+            features,
+            scaling,
+            rotation,
+            opacity,
+            height,
+            width,
+            C2W=c2w_target,
+            fxfycxcy=fxfycxcy_target,
+        )
+        render_results = edict(
+            rendered_images=render.render
+        )
+
+        with torch.no_grad():
+            vis_only_results = self.render_images_video(gaussian_attrs, c2w_target, fxfycxcy_target, normalized=False, step_back=self.config.get('evaluation_step_back_distance', 0))
+            # vis_only_results_input = self.render_images_video(gaussian_attrs, c2w_input, fxfycxcy_input, normalized=False)
+
+        gaussians = []
+        pixelalign_xyz = []
+        gaussians_usage = []
+        gaussians_scale = []
+        gaussians_opacity = []
+        for b in range(xyz.size(0)):
+            self.renderer.gaussians_model.empty()
+            gaussians_model = copy.deepcopy(self.renderer.gaussians_model)
+            gaussians.append(
+                gaussians_model.set_data(
+                    xyz[b].detach().float(),
+                    features[b].detach().float(),
+                    scaling[b].detach().float(),
+                    rotation[b].detach().float(),
+                    opacity[b].detach().float(),
+                )
+            )
+
+            threshold = 0.05
+            usage_mask = gaussians[-1].get_opacity > threshold
+            usage = usage_mask.sum() / usage_mask.numel()
+            if torch.is_tensor(usage):
+                usage = usage.item()
+            gaussians_usage.append(usage)
+
+            mean_scale = gaussians[-1].get_scaling.mean()
+            if torch.is_tensor(mean_scale):
+                mean_scale = mean_scale.item()
+            gaussians_scale.append(mean_scale)
+
+            mean_opacity = gaussians[-1].get_opacity.mean()
+            if torch.is_tensor(mean_opacity):
+                mean_opacity = mean_opacity.item()
+            gaussians_opacity.append(mean_opacity)
+
+            img_aligned_xyz = gaussians[-1].get_xyz
+            img_aligned_xyz = rearrange(
+                img_aligned_xyz,
+                "(v hh ww ph pw) c -> v c (hh ph) (ww pw)",
+                v=v,
+                hh=self.hh,
+                ww=self.ww,
+                ph=self.ph,
+                pw=self.pw,
+            )
+            pixelalign_xyz.append(img_aligned_xyz)
+        pixelalign_xyz = torch.stack(pixelalign_xyz, dim=0)
+
+        # return results
+        result = edict(
+            ray_o=ray_o,
+            gaussians=gaussians,
+            pixelalign_xyz=pixelalign_xyz,
+            image=data['image'],
+            render=render_results.rendered_images,
+            c2w=pred_c2w,
+            fxfycxcy=rearrange(pred_fxfycxcy, 'b v d -> (b v) d'),
+            c2w_input=c2w_input,
+            fxfycxcy_input=fxfycxcy_input,
+            c2w_target=c2w_target,
+            fxfycxcy_target=fxfycxcy_target,
+        )
+
+        result.render_video = vis_only_results.rendered_images_video.detach().clamp(0, 1)
+
+        return result
+
+
     def add_spatial_pe(self, tokens, b, v, h_tokens, w_tokens, embedder):
         """
         Add spatial (and optionally temporal) positional encoding to tokens.

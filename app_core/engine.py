@@ -204,6 +204,7 @@ class ERayZerEngine:
         training = self.config.training
         tokenizer = self.config.model.image_tokenizer
         self.image_size = int(tokenizer.image_size)
+        self.pretrained = not self.config.inference
         self.num_views = int(training.num_views)
         self.num_input_views = int(training.num_input_views)
         self.num_target_views = int(training.num_target_views)
@@ -269,6 +270,8 @@ class ERayZerEngine:
         return Image.fromarray(array)
 
     def _prepare_batch(self, image_files: Sequence[str]) -> Dict[str, torch.Tensor]:
+        if self.pretrained:
+            self.num_views = len(image_files)
         if len(image_files) != self.num_views:
             print(f"Warning: expected {self.num_views} views, but got {len(image_files)}; padding inputs to {self.num_views} views.")
 
@@ -280,6 +283,8 @@ class ERayZerEngine:
         intrinsics = torch.tensor(
             [[[1.0, 1.0, 0.5, 0.5]] * self.num_views], dtype=torch.float32
         )
+        print(f'images shape: {images.shape}')
+        print(f'intrinsics shape: {intrinsics.shape}')
         return {"image": images, "fxfycxcy": intrinsics}
 
     def _move_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -298,10 +303,15 @@ class ERayZerEngine:
             if self.device.type == "cuda"
             else nullcontext()
         )
-
+        
         with torch.no_grad():
             with autocast_ctx:
-                result = self.model(batch_gpu)
+                if self.pretrained:
+                    print('Running pretrained E-RayZer model inference...')
+                    result = self.model.forward_inference(batch_gpu)
+                else:
+                    print('Running default E-RayZer model forward...')
+                    result = self.model(batch_gpu)
 
         run_dir, glb_path, video_path = self._export_outputs(result)
         gallery_paths = sorted(
