@@ -245,7 +245,8 @@ class ERayZerEngine:
         cfg.inference_view_selector_type = cfg.get("inference_view_selector_type", training.view_selector.type)
 
     def _load_model(self) -> torch.nn.Module:
-        if isinstance(self.config.model.model_params, dict):
+        if 'model_params' in self.config.model:
+        # if isinstance(self.config.model.model_params, dict):
             self.config = edict(self.config.model.model_params)
         module_name, class_name = self.config.model.class_name.rsplit(".", 1)
         ModelClass = __import__(module_name, fromlist=[class_name]).__dict__[class_name]
