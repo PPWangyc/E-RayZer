@@ -514,9 +514,7 @@ class ERayZer(nn.Module):
         # input, target, input_idx, target_idx = self.split_data(data, random_index=self.random_index)
         image_all = data['image'] * 2.0 - 1.0                                     # [b, v_all, c, h, w], range (0,1) to (-1,1)
         b, v, c, h, w = image_all.shape
-        device = image_all.device
 
-        pad_input = False
         v_all = v
 
         '''se3 pose prediction for all views'''
