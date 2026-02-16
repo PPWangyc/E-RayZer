@@ -9,8 +9,8 @@ def rot6d2mat(x):
     device = x.device
     B = x.shape[0]
 
-    a1 = x[:, 0:3]
-    a2 = x[:, 3:6]
+    a1 = x[:, 0:3].clone()
+    a2 = x[:, 3:6].clone()
     b1 = F.normalize(a1)
     b2 = F.normalize(a2 - torch.einsum('bi,bi->b', b1, a2).unsqueeze(-1) * b1)
     b3 = torch.cross(b1, b2, dim=1)
