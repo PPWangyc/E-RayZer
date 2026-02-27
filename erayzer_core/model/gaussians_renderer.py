@@ -735,6 +735,8 @@ def render_opencv_cam_gsplat(
     scales = pc.get_scaling
     rotations = pc.get_rotation
     shs = pc.get_features
+    if bg_color is None:
+        bg_color=(0.0, 0.0, 0.0)
     # Compatible with gsplat v1.4.0
     bg_color = torch.tensor(list(bg_color), dtype=torch.float32, device=C2W.device).unsqueeze(0).expand(C2W.size(0), -1)
     # For newer versions:
@@ -749,7 +751,7 @@ def render_opencv_cam_gsplat(
     intr[:, 2, 2] = 1.0
 
     render_mode = "RGB+ED" if render_depth else 'RGB'
-    render_colors, _, _ = rasterization(means3D, rotations, scales, opacity.squeeze(), 
+    render_colors, render_alphas, _ = rasterization(means3D, rotations, scales, opacity.squeeze(), 
                                         shs, W2C, intr, width, height, 
                                         near_plane=near_plane,
                                         sh_degree=sh_degree, 
@@ -761,7 +763,8 @@ def render_opencv_cam_gsplat(
         render_depth = None
     return {
         "render": render_colors.permute(0, 3, 1, 2),
-        "depth": render_depth.permute(0, 3, 1, 2) if torch.is_tensor(render_depth) else None
+        "depth": render_depth.permute(0, 3, 1, 2) if torch.is_tensor(render_depth) else None,
+        "alpha": render_alphas.permute(0, 3, 1, 2)
     }
 
 

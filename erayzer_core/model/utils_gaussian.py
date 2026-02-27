@@ -30,6 +30,7 @@ class Renderer(nn.Module):
         C2W,
         fxfycxcy,
         deferred=True,
+        backgrounds=None,
     ):
         """
         xyz: [b, n_gaussians, 3]
@@ -79,7 +80,8 @@ class Renderer(nn.Module):
                     near_plane = self.config.model.get("near_plane", 0.2)
                     buffers = render_opencv_cam_gsplat(
                         pc, height, width, C2W[i], fxfycxcy[i], self.sh_degree,
-                        near_plane=near_plane
+                        near_plane=near_plane,
+                        bg_color=backgrounds
                     )
                     renderings[i] = buffers["render"]
                     if "depth" in buffers and buffers["depth"] is not None:
