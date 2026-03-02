@@ -16,6 +16,68 @@ from torch import nn
 from collections import OrderedDict
 import videoio
 
+def camera_frustum_constraint(xyz, opacity, c2w, fxfycxcy, H, W, normalized=False):
+    """
+    Apply camera frustum constraint: filter points outside the camera frustum.
+    
+    Args:
+        xyz: 3D points [N, 3]
+        opacity: opacity values [N, 1]
+        c2w: camera-to-world matrices [V, 4, 4]
+        fxfycxcy: camera intrinsics [V, 4]
+        H, W: image dimensions
+        normalized: whether the intrinsics is normalized
+    Returns:
+        opacity: modified opacity with points outside camera frustum set to zero
+    """
+    N_points, _ = xyz.shape
+    xyz_h = torch.cat([xyz, torch.ones(N_points, 1, device=xyz.device, dtype=xyz.dtype)], dim=-1)
+    valid_3d_mask = torch.ones(N_points, device=xyz.device, dtype=torch.bool)
+
+    V = c2w.shape[0]
+    
+    for v in range(V):
+        w2c_v = torch.inverse(c2w[v]) 
+        fx_v = fxfycxcy[v, 0]
+        fy_v = fxfycxcy[v, 1]
+        cx_v = fxfycxcy[v, 2]
+        cy_v = fxfycxcy[v, 3]
+        
+        # 1. Transform to each camera coordinate system
+        xyz_c = torch.matmul(xyz_h, w2c_v.transpose(-1, -2))[..., :3] 
+        z = xyz_c[..., 2:3] + 1e-6 
+        
+        # 2. Pinhole camera projection
+        x = xyz_c[..., 0:1] / z
+        y = xyz_c[..., 1:2] / z
+        u = x * fx_v + cx_v
+        v_coord = y * fy_v + cy_v
+        
+        # 3. Normalize to [-1, 1] for evaluation
+        if normalized:
+            u_norm = u * 2.0 - 1.0
+            v_norm = v_coord * 2.0 - 1.0
+        else:
+            u_norm = (u / (W - 1)) * 2.0 - 1.0
+            v_norm = (v_coord / (H - 1)) * 2.0 - 1.0
+        
+        # ==========================================
+        # [Change] Abandon strict mask, use frustum boundary (Frustum Bounding)
+        # ==========================================
+        # As long as this point projects within the 2D boundary of the image (-1 to 1), 
+        # we consider it to be in the current camera's field of view (FOV)
+        in_fov_u = (u_norm.squeeze(-1) >= -1.0) & (u_norm.squeeze(-1) <= 1.0)
+        in_fov_v = (v_norm.squeeze(-1) >= -1.0) & (v_norm.squeeze(-1) <= 1.0)
+        
+        # Must be in front of the camera (z > 0) and within the image bounds
+        is_inside_frustum = in_fov_u & in_fov_v & (z.squeeze(-1) > 0)
+        
+        # Logical AND: Only the 3D space that is simultaneously "seen" by all cameras 
+        # is the intersection space we allow to be generated
+        valid_3d_mask = valid_3d_mask & is_inside_frustum
+
+    opacity = torch.where(valid_3d_mask.unsqueeze(-1), opacity, torch.zeros_like(opacity))
+    return opacity
 
 @torch.no_grad()
 def get_turntable_cameras(
@@ -728,7 +790,8 @@ def render_opencv_cam_gsplat(
     sh_degree: Union[int, None] = None,
     near_plane=0.2,
     bg_color=(1.0, 1.0, 1.0),
-    render_depth=False
+    render_depth=False,
+    frustum_constraint=False
 ):
     means3D = pc.get_xyz # [N, 3]
     opacity = pc.get_opacity
@@ -750,6 +813,9 @@ def render_opencv_cam_gsplat(
     intr[:, 1, 2] = fxfycxcy[:, 3]
     intr[:, 2, 2] = 1.0
 
+    if frustum_constraint:
+        opacity = camera_frustum_constraint(means3D, opacity, C2W, fxfycxcy, height, width)
+    
     render_mode = "RGB+ED" if render_depth else 'RGB'
     render_colors, render_alphas, _ = rasterization(means3D, rotations, scales, opacity.squeeze(), 
                                         shs, W2C, intr, width, height, 
@@ -764,7 +830,8 @@ def render_opencv_cam_gsplat(
     return {
         "render": render_colors.permute(0, 3, 1, 2),
         "depth": render_depth.permute(0, 3, 1, 2) if torch.is_tensor(render_depth) else None,
-        "alpha": render_alphas.permute(0, 3, 1, 2)
+        "alpha": render_alphas.permute(0, 3, 1, 2),
+        "sigmoid_opacity": opacity
     }
 
 

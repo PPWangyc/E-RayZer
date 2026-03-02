@@ -837,7 +837,7 @@ class ERayZer(nn.Module):
             return concat_nerf_img_tokens
         return custom_forward
 
-    def render_images_video(self, gaussian_attrs, c2w_all, fxfycxcy_all, normalized=False, step_back=0):
+    def render_images_video(self, gaussian_attrs, c2w_all, fxfycxcy_all, normalized=False, step_back=0, frustum_constraint=False):
         '''
         points_input_all  : [b, v_input, h_rend_input, w_rend_input, 3]
         features_input_all: [b, v_input, h_rend_input, w_rend_input, c]
@@ -911,6 +911,7 @@ class ERayZer(nn.Module):
                         self.config.model.image_tokenizer.image_size,
                         C2W=batch_c2w,
                         fxfycxcy=batch_fx,
+                        frustum_constraint=frustum_constraint,
                     ).render.squeeze(0)  # [batch_size, H, W, 3]
 
                     renderings.append(rendered_images_batch)

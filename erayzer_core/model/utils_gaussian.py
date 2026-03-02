@@ -31,6 +31,7 @@ class Renderer(nn.Module):
         fxfycxcy,
         deferred=True,
         backgrounds=None,
+        frustum_constraint=False
     ):
         """
         xyz: [b, n_gaussians, 3]
@@ -43,7 +44,7 @@ class Renderer(nn.Module):
         width: int
         C2W: [b, v, 4, 4]
         fxfycxcy: [b, v, 4]
-
+        frustum_constraint: bool
         output: [b, v, 3, height, width]
         """
 
@@ -72,6 +73,9 @@ class Renderer(nn.Module):
                 b, v, 1, height, width, dtype=torch.float32, device=xyz.device
             )
 
+            # opacitys
+            sigmoid_opacitys = torch.zeros_like(opacity)
+            
             for i in range(b):
                 pc = self.gaussians_model.set_data(
                     xyz[i], features[i], scaling[i], rotation[i], opacity[i]
@@ -81,13 +85,17 @@ class Renderer(nn.Module):
                     buffers = render_opencv_cam_gsplat(
                         pc, height, width, C2W[i], fxfycxcy[i], self.sh_degree,
                         near_plane=near_plane,
-                        bg_color=backgrounds
+                        bg_color=backgrounds,
+                        frustum_constraint=frustum_constraint
                     )
                     renderings[i] = buffers["render"]
                     if "depth" in buffers and buffers["depth"] is not None:
                         depth[i] = buffers["depth"]
                     if "alpha" in buffers and buffers["alpha"] is not None:
                         alpha[i] = buffers["alpha"]
+                    # Collect constrained opacity if available
+                    if "sigmoid_opacity" in buffers and buffers["sigmoid_opacity"] is not None:
+                        sigmoid_opacitys[i] = buffers["sigmoid_opacity"]
                 else:
                     for j in range(v):
                         # renderings[i, j] = render_opencv_cam(
@@ -101,9 +109,9 @@ class Renderer(nn.Module):
                             depth[i, j] = buffers["depth"]
                         if "alpha" in buffers and buffers["alpha"] is not None:
                             alpha[i, j] = buffers["alpha"]
-
+            
         # return renderings
-        return edict(render=renderings, depth=depth, alpha=alpha)
+        return edict(render=renderings, depth=depth, alpha=alpha, sigmoid_opacity=sigmoid_opacitys)
 
 
 def get_point_range_func(gaussians_config):
